@@ -1,6 +1,6 @@
 /*
 
-(C) 2009-2014, Kees Verruijt, Harlingen, The Netherlands.
+(C) 2009-2015, Kees Verruijt, Harlingen, The Netherlands.
 
 This file is part of CANboat.
 
@@ -35,58 +35,63 @@ static char * progName;
 
 #ifndef WIN32
 
-static int logBase(LogLevel level, const char * format, va_list ap)
+const char * now(char str[DATE_LENGTH])
 {
   struct timeval tv;
   time_t t;
   struct tm tm;
   int msec;
-  char strTmp[60];
-
-  if (level > logLevel)
-  {
-    return 0;
-  }
-
+  size_t len;
 
   if (gettimeofday(&tv, (void *) 0) == 0)
   {
     t = tv.tv_sec;
     msec = tv.tv_usec / 1000L;
-    localtime_r(&t, &tm);
-    strftime(strTmp, 60, "%Y-%m-%d %H:%M:%S", &tm);
-    fprintf(stderr, "%s %s.%3.3d [%s] ", logLevels[level], strTmp, msec, progName);
+    gmtime_r(&t, &tm);
+    strftime(str, DATE_LENGTH - 5, "%Y-%m-%dT%H:%M:%S", &tm);
+    len = strlen(str);
+    snprintf(str + len, DATE_LENGTH - len, ".%3.3dZ", msec);
   }
   else
   {
-    fprintf(stderr, "%s [%s] ", logLevels[level], progName);
+    strcpy(str, "?");
   }
 
-  return vfprintf(stderr, format, ap);
+  return (const char *) str;
 }
 
 #else
 
-static int logBase(LogLevel level, const char * format, va_list ap)
+const char * now(char str[DATE_LENGTH])
 {
   struct _timeb timebuffer;
   struct tm tm;
-  char strTmp[60];
+  size_t len;
+
+  _ftime_s(&timebuffer);
+  gmtime_s(&tm, &timebuffer.time);
+  strftime(str, DATE_LENGTH - 5, "%Y-%m-%dT%H:%M:%S", &tm);
+  len = strlen(str);
+  snprintf(str + len, DATE_LENGTH - len, ".%3.3dZ", timebuffer.millitm);
+
+  return (const char *) str;
+}
+
+#endif
+
+static int logBase(LogLevel level, const char * format, va_list ap)
+{
+  char strTmp[DATE_LENGTH];
 
   if (level > logLevel)
   {
     return 0;
   }
 
-  _ftime_s(&timebuffer);
-  localtime_s(&tm, &timebuffer.time);
-  strftime(strTmp, 60, "%Y-%m-%d %H:%M:%S", &tm);
-  fprintf(stderr, "%s %s.%3.3d [%s] ", logLevels[level], strTmp, timebuffer.millitm, progName);
+  fprintf(stderr, "%s %s [%s] ", logLevels[level], now(strTmp), progName);
 
   return vfprintf(stderr, format, ap);
 }
-
-#endif
 
 int logInfo(const char * format, ...)
 {
@@ -201,6 +206,99 @@ void sbAppendString(StringBuffer * sb, const char * string)
 {
   size_t len = strlen(string);
   sbAppendData(sb, string, len);
+}
+
+static void sbReserve(StringBuffer *const sb, size_t len)
+{
+  size_t nextSize;
+
+  if (len < sb->len)
+  {
+    len = sb->len;
+  }
+
+  /* Double the allocation until it is large enough */
+  /* Note that we reserve len + 1 bytes (== len + zero terminator) */
+  for (nextSize = 32; nextSize < len + 1; nextSize = nextSize * 2)
+    ;
+
+  if (sb->data)
+  {
+    sb->data = realloc(sb->data, nextSize);
+  }
+  else
+  {
+    sb->data = malloc(nextSize);
+  }
+
+  if (!sb->data)
+  {
+    logAbort("Out of memory in allocating string buffer\n");
+  }
+  sbTerminate(sb);
+  sb->alloc = nextSize;
+}
+
+static void sbEnsureCapacity(StringBuffer *const sb, size_t len)
+{
+  len++; // Make room for termination zero byte
+  if (!sb->data || (len >= sb->alloc))
+  {
+    sbReserve(sb, len);
+  }
+}
+
+
+void sbAppendFormatV(StringBuffer *const sb, const char *const format, va_list ap)
+{
+  int n;
+  size_t len;
+  va_list ap2;
+
+  len = 128;
+
+  while (len < 4 * 1024 * 1024)
+  {
+    sbEnsureCapacity(sb, sb->len + len);
+
+    va_copy(ap2, ap);
+    n = vsnprintf(sb->data + sb->len, len, format, ap2);
+    va_end(ap2);
+    /*
+     * Platform returned not an error, and the number of bytes was less
+     * than the size of the buffer -> we're done
+     * Note that some implementations (tru64) nicely guarantee zero terminated strings,
+     * so we test for len - 1, not len.
+     */
+    if (n > -1 && (size_t) n < len - 1)
+    {
+      sb->len += n;
+      sbTerminate(sb);
+      break;
+    }
+
+    /*
+     * Otherwise, increase the buffer smartly
+     */
+
+    if (n == -1)
+    {
+      len *= 2;
+    }
+    else
+    {
+      len = n + 2;
+    }
+  }
+}
+
+void sbAppendFormat(StringBuffer *const sb, const char *const format, ...)
+{
+  va_list ap;
+
+  va_start(ap, format);
+  sbAppendFormatV(sb, format, ap);
+  va_end(ap);
 }
 
 /*
@@ -400,6 +498,25 @@ void getISO11783BitsFromCanId(unsigned int id, unsigned int * prio, unsigned int
 
 }
 
+/*
+  This does the opposite from getISO11783BitsFromCanId: given n2k fields produces the extended frame CAN id
+*/
+unsigned int getCanIdFromISO11783Bits(unsigned int prio, unsigned int pgn, unsigned int src, unsigned int dst)
+{
+  unsigned int canId = src | 0x80000000U;  // src bits are the lowest ones of the CAN ID. Also set the highest bit to 1 as n2k uses only extended frames (EFF bit).
+
+  if((unsigned char)pgn == 0) {  // PDU 1 (assumed if 8 lowest bits of the PGN are 0)
+    canId += dst << 8;
+    canId += pgn << 8;
+    canId += prio << 26;
+  } else {                       // PDU 2
+    canId += pgn << 8;
+    canId += prio << 26;
+  }
+
+  return canId;
+}
+
 static void resolve_address(const char * url, char ** host, const char ** service)
 {
   const char *s;
@@ -491,3 +608,44 @@ SOCKET open_socket_stream(const char * url)
   return sockfd;
 }
 
+uint8_t scanNibble(char c)
+{
+  if (isdigit(c))
+  {
+    return c - '0';
+  }
+  if (c >= 'A' && c <= 'F')
+  {
+    return c - 'A' + 10;
+  }
+  if (c >= 'a' && c <= 'f')
+  {
+    return c - 'a' + 10;
+  }
+  return 16;
+}
+
+int scanHex(char ** p, uint8_t * m)
+{
+  uint8_t hi, lo;
+
+  if (!(*p)[0] || !(*p)[1])
+  {
+    return 1;
+  }
+
+  hi = scanNibble((*p)[0]);
+  if (hi > 15)
+  {
+    return 1;
+  }
+  lo = scanNibble((*p)[1]);
+  if (lo > 15)
+  {
+    return 1;
+  }
+  (*p) += 2;
+  *m = hi << 4 | lo;
+  /* printf("(b=%02X,p=%p) ", *m, *p); */
+  return 0;
+}

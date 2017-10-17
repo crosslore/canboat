@@ -1,5 +1,5 @@
 #
-# (C) 2009-2014, Kees Verruijt, Harlingen, The Netherlands.
+# (C) 2009-2015, Kees Verruijt, Harlingen, The Netherlands.
 #
 # This file is part of CANboat.
 #
@@ -25,7 +25,7 @@ TARGETS=$(ACTISENSE)
 all: $(TARGETS)
 
 $(ACTISENSE): actisense-serial.c actisense.h ../common/common.c ../common/common.h
-	$(CC) -o $(ACTISENSE) -I../common actisense-serial.c ../common/common.c $(LDLIBS$(LDLIBS-$(@)))
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $(ACTISENSE) -I../common actisense-serial.c ../common/common.c $(LDLIBS$(LDLIBS-$(@)))
 
 clean:
 	-rm -f $(TARGETS) *.elf *.gdb

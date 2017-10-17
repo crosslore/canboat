@@ -14,6 +14,7 @@
 #include <sys/time.h>
 
 #include "license.h"
+#include "common.h"
 
 /*
 , "NMEA - Command/Request/Acknowledge group function", 126208, false, 15, 2,
@@ -43,8 +44,6 @@ typedef struct
   uint8_t count;
   uint8_t parameters[MAX_FIELDS * 5];
 } PACKED command_group_function_t;
-
-static char * now(void);
 
 void usage(char ** argv, char ** av)
 {
@@ -76,6 +75,7 @@ int main(int argc, char ** argv)
   char * p, * e;
   uint8_t * b;
   uint32_t v;
+  char dateStr[DATE_LENGTH];
 
   if (ac < 5 || ac > 4 + MAX_FIELDS)
   {
@@ -123,35 +123,11 @@ int main(int argc, char ** argv)
   command.count = cnt;
 
   bytes = b - (uint8_t *) &command;
-  printf("%s,2,126208,0,%lu,%zu", now(), dest, bytes);
+  printf("%s,2,126208,0,%lu,%zu", now(dateStr), dest, bytes);
   for (i = 0; i < bytes; i++)
   {
     printf(",%02x", ((unsigned char *) &command)[i]);
   }
   printf("\n");
   exit(0);
-}
-
-
-static char * now(void)
-{
-  static char str[64];
-  struct timeval tv;
-  struct tm tm;
-
-  str[0] = 0;
-
-  if (gettimeofday(&tv, 0) != 0)
-  {
-    return "?";
-  }
-
-  gmtime_r(&tv.tv_sec, &tm);
-
-  snprintf(str, sizeof(str), "%u", (unsigned int) tv.tv_sec);
-
-  strftime(str, sizeof(str) - 5, "%F-%T", &tm);
-  snprintf(str + strlen(str), 5, ".%03d", (int) (tv.tv_usec / 1000L));
-
-  return str;
 }

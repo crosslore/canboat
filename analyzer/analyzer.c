@@ -2,7 +2,7 @@
 
 Analyzes NMEA 2000 PGNs.
 
-(C) 2009-2014, Kees Verruijt, Harlingen, The Netherlands.
+(C) 2009-2015, Kees Verruijt, Harlingen, The Netherlands.
 
 This file is part of CANboat.
 
@@ -21,11 +21,9 @@ along with CANboat.  If not, see <http://www.gnu.org/licenses/>.
 
 */
 
-#include "common.h"
+#define  GLOBALS
 #include "analyzer.h"
-
-DevicePackets * device[256];
-char * manufacturer[1 << 12];
+#include "common.h"
 
 enum RawFormats
 {
@@ -44,23 +42,41 @@ enum GeoFormats
   GEO_DMS
 };
 
+typedef struct
+{
+  size_t lastFastPacket;
+  size_t size;
+  size_t allocSize;
+  uint8_t * data;
+} Packet;
+
+typedef struct
+{
+  Packet packetList[ARRAY_SIZE(pgnList)];
+} DevicePackets;
+
+DevicePackets * device[256];
+char *manufacturer[1 << 12];
 
 bool showRaw = false;
 bool showData = false;
 bool showBytes = false;
 bool showJson = false;
+bool showJsonValue = false;
+bool showSI = false; // Output everything in strict SI units
 char * sep = " ";
-int  braceCount = 0; // Open json output { characters that need to be closed
+char closingBraces[8]; // } and ] chars to close sentence in JSON mode, otherwise empty string
 enum GeoFormats showGeo = GEO_DD;
 int onlyPgn = 0;
 int onlySrc = -1;
 int clockSrc = -1;
 size_t heapSize = 0;
 
+int g_variableFieldRepeat[2]; // Actual number of repetitions
+int g_variableFieldIndex;
+
 static void fillManufacturers(void);
 static void fillFieldCounts(void);
-static uint8_t scanNibble(char c);
-static int scanHex(char ** p, uint8_t * m);
 static bool printNumber(char * fieldName, Field * field, uint8_t * data, size_t startBit, size_t bits);
 
 void initialize(void);
@@ -73,7 +89,7 @@ void camelCase(bool upperCamelCase);
 void usage(char ** argv, char ** av)
 {
   printf("Unknown or invalid argument %s\n", av[0]);
-  printf("Usage: %s [[-raw] [-json [-camel | -upper-camel]] [-data] [-debug] [-d] [-q] [-geo {dd|dm|dms}] [-src <src> | <pgn>]] ["
+  printf("Usage: %s [[-raw] [-json [-nv] [-camel | -upper-camel]] [-data] [-debug] [-d] [-q] [-si] [-geo {dd|dm|dms}] [-src <src> | <pgn>]] ["
 #ifndef SKIP_SETSYSTEMCLOCK
          "-clocksrc <src> | "
 #endif
@@ -140,6 +156,14 @@ int main(int argc, char ** argv)
       ac--;
       av++;
     }
+    else if (strcasecmp(av[1], "-si") == 0)
+    {
+      showSI = true;
+    }
+    else if (strcasecmp(av[1], "-nosi") == 0)
+    {
+      showSI = false;
+    }
     else if (strcasecmp(av[1], "-camel") == 0)
     {
       camelCase(false);
@@ -151,6 +175,10 @@ int main(int argc, char ** argv)
     else if (strcasecmp(av[1], "-json") == 0)
     {
       showJson = true;
+    }
+    else if (strcasecmp(av[1], "-nv") == 0)
+    {
+      showJsonValue = true;
     }
     else if (strcasecmp(av[1], "-data") == 0)
     {
@@ -212,11 +240,12 @@ int main(int argc, char ** argv)
 
   if (!showJson)
   {
-    logInfo("N2K packet analyzer "PROGRAM_REV" from "PROGRAM_DATE"\n" COPYRIGHT);
+    logInfo("N2K packet analyzer\n" COPYRIGHT);
   }
 
   fillManufacturers();
   fillFieldCounts();
+  checkPgnList();
 
   while (fgets(msg, sizeof(msg) - 1, file))
   {
@@ -232,10 +261,7 @@ int main(int argc, char ** argv)
 
     if (format != RAWFORMAT_CHETCO && msg[0] == '$' && strncmp(msg, "$PCDIN", 6) == 0)
     {
-      if (showBytes)
-      {
-        logInfo("Detected Chetco protocol with all data on one line\n");
-      }
+      logDebug("Detected Chetco protocol with all data on one line\n");
       format = RAWFORMAT_CHETCO;
     }
 
@@ -255,9 +281,9 @@ int main(int argc, char ** argv)
         p = strchr(msg, ' ');
         if (p && (p[1] == '-' || p[2] == '-'))
         {
-          if (format != RAWFORMAT_AIRMAR && showBytes)
+          if (format != RAWFORMAT_AIRMAR)
           {
-            logInfo("Detected Airmar protocol with all data on one line\n");
+            logDebug("Detected Airmar protocol with all data on one line\n");
           }
           format = RAWFORMAT_AIRMAR;
         }
@@ -272,238 +298,56 @@ int main(int argc, char ** argv)
 
     if (format == RAWFORMAT_PLAIN)
     {
-      unsigned int data[8];
-
-      memcpy(m.timestamp, msg, p - msg);
-      m.timestamp[p - msg] = 0;
-
-      /* Moronic Windows does not support %hh<type> so we use intermediate variables */
       r = sscanf( p
-        , ",%u,%u,%u,%u,%u"
-        ",%x,%x,%x,%x,%x,%x,%x,%x,%x"
-        , &prio
-        , &pgn
-        , &src
-        , &dst
+        , ",%*u,%*u,%*u,%*u,%u"
+        ",%*x,%*x,%*x,%*x,%*x,%*x,%*x,%*x,%*x"
         , &len
-        , &data[0]
-        , &data[1]
-        , &data[2]
-        , &data[3]
-        , &data[4]
-        , &data[5]
-        , &data[6]
-        , &data[7]
-        , &junk
       );
-      if (r < 5)
+      if (r < 1)
       {
         logError("Error reading message, scanned %u from %s", r, msg);
         if (!showJson) fprintf(stdout, "%s", msg);
         continue;
       }
-      if (r <= 5 + 8)
+      if(len <= 8)
       {
-        for (i = 0; i < len; i++)
+        if(parseRawFormatPlain(msg, &m, showJson))
         {
-          m.data[i] = data[i];
+          continue;  // Some error occurred -> skip line
         }
       }
       else
       {
-        if (showBytes)
-        {
-          logInfo("Detected Fast protocol with all data on one line\n");
-        }
+        logDebug("Detected Fast protocol with all data on one line\n");
         format = RAWFORMAT_FAST;
       }
     }
     if (format == RAWFORMAT_FAST)
     {
-      memcpy(m.timestamp, msg, p - msg);
-      m.timestamp[p - msg] = 0;
-
-      /* Moronic Windows does not support %hh<type> so we use intermediate variables */
-      r = sscanf( p
-        , ",%u,%u,%u,%u,%u "
-        , &prio
-        , &pgn
-        , &src
-        , &dst
-        , &len
-      );
-      if (r < 5)
+      if(parseRawFormatFast(msg, &m, showJson))
       {
-        logError("Error reading message, scanned %u from %s", r, msg);
-        if (!showJson) fprintf(stdout, "%s", msg);
-        continue;
-      }
-      for (i = 0; *p && i < 5;)
-      {
-        if (*++p == ',')
-        {
-          i++;
-        }
-      }
-      if (!p)
-      {
-        logError("Error reading message, scanned %zu bytes from %s", p - msg, msg);
-        if (!showJson) fprintf(stdout, "%s", msg);
-        continue;
-      }
-      p++;
-      for (i = 0; i < len; i++)
-      {
-        if (scanHex(&p, &m.data[i]))
-        {
-          logError("Error reading message, scanned %zu bytes from %s/%s, index %u", p - msg, msg, p, i);
-          if (!showJson) fprintf(stdout, "%s", msg);
-          continue;
-        }
-        if (i < len)
-        {
-          if (*p != ',' && !isspace(*p))
-          {
-            logError("Error reading message, scanned %zu bytes from %s", p - msg, msg);
-            if (!showJson) fprintf(stdout, "%s", msg);
-            continue;
-          }
-          p++;
-        }
+        continue;  // Some error occurred -> skip line
       }
     }
     else if (format == RAWFORMAT_AIRMAR)
     {
-      unsigned int id;
-
-      memcpy(m.timestamp, msg, p - msg - 1);
-      m.timestamp[p - msg - 1] = 0;
-      p += 3;
-
-      /* Moronic Windows does not support %hh<type> so we use intermediate variables */
-      pgn = strtoul(p, &p, 10);
-      if (*p == ' ')
+      if(parseRawFormatAirmar(msg, &m, showJson))
       {
-        id = strtoul(++p, &p, 16);
-      }
-      if (*p != ' ')
-      {
-        logError("Error reading message, scanned %zu bytes from %s", p - msg, msg);
-        if (!showJson) fprintf(stdout, "%s", msg);
-        continue;
-      }
-
-      getISO11783BitsFromCanId(id, &prio, &pgn, &src, &dst);
-
-      p++;
-      len = strlen(p) / 2;
-      for (i = 0; i < len; i++)
-      {
-        if (scanHex(&p, &m.data[i]))
-        {
-          logError("Error reading message, scanned %zu bytes from %s/%s, index %u", p - msg, msg, p, i);
-          if (!showJson) fprintf(stdout, "%s", msg);
-          continue;
-        }
-        if (i < len)
-        {
-          if (*p != ',' && *p != ' ')
-          {
-            logError("Error reading message, scanned %zu bytes from %s", p - msg, msg);
-            if (!showJson) fprintf(stdout, "%s", msg);
-            continue;
-          }
-          p++;
-        }
+        continue;  // Some error occurred -> skip line
       }
     }
     else if (format == RAWFORMAT_CHETCO)
     {
-      unsigned int tstamp;
-      time_t t;
-      struct tm tm;
-
-      if (sscanf(msg, "$PCDIN,%x,%x,%x,", &pgn, &tstamp, &src) < 3)
+      if(parseRawFormatChetco(msg, &m, showJson))
       {
-        logError("Error reading Chetco message: %s", msg);
-        if (!showJson) fprintf(stdout, "%s", msg);
-        continue;
+        continue;  // Some error occurred -> skip line
       }
-
-      t = (time_t) tstamp / 1000;
-      localtime_r(&t, &tm);
-      strftime(m.timestamp, sizeof(m.timestamp), "%Y-%m-%d-%H:%M:%S", &tm);
-      sprintf(m.timestamp + strlen(m.timestamp), ",%u", tstamp % 1000);
-
-      p = msg + STRSIZE("$PCDIN,01FD07,089C77D!,03,"); // Fixed length where data bytes start;
-
-      for (i = 0; *p != '*'; i++)
-      {
-        if (scanHex(&p, &m.data[i]))
-        {
-          logError("Error reading message, scanned %zu bytes from %s/%s, index %u", p - msg, msg, p, i);
-          if (!showJson) fprintf(stdout, "%s", msg);
-          continue;
-        }
-      }
-
-      prio = 0;
-      dst = 255;
-      len = i + 1;
     }
-
-    m.prio = prio;
-    m.pgn  = pgn;
-    m.dst  = dst;
-    m.src  = src;
-    m.len  = len;
 
     printCanFormat(&m);
     printCanRaw(&m);
   }
 
-  return 0;
-}
-
-static uint8_t scanNibble(char c)
-{
-  if (isdigit(c))
-  {
-    return c - '0';
-  }
-  if (c >= 'A' && c <= 'F')
-  {
-    return c - 'A' + 10;
-  }
-  if (c >= 'a' && c <= 'f')
-  {
-    return c - 'a' + 10;
-  }
-  return 16;
-}
-
-static int scanHex(char ** p, uint8_t * m)
-{
-  uint8_t hi, lo;
-
-  if (!(*p)[0] || !(*p)[1])
-  {
-    return 1;
-  }
-
-  hi = scanNibble((*p)[0]);
-  if (hi > 15)
-  {
-    return 1;
-  }
-  lo = scanNibble((*p)[1]);
-  if (lo > 15)
-  {
-    return 1;
-  }
-  (*p) += 2;
-  *m = hi << 4 | lo;
-  /* printf("(b=%02X,p=%p) ", *m, *p); */
   return 0;
 }
 
@@ -516,7 +360,12 @@ char * getSep()
     sep = ",";
     if (strchr(s, '{'))
     {
-      braceCount++;
+      if (strlen(closingBraces) >= sizeof(closingBraces) - 2)
+      {
+        logError("Too many braces\n");
+        exit(2);
+      }
+      strcat(closingBraces, "}");
     }
   }
   else
@@ -527,11 +376,13 @@ char * getSep()
   return s;
 }
 
-
 static void fillManufacturers(void)
 {
   size_t i;
 
+  for (i = 0; i < ARRAY_SIZE(manufacturer); i++) {
+    manufacturer[i] = 0;
+  }
   for (i = 0; i < ARRAY_SIZE(companyList); i++)
   {
     manufacturer[companyList[i].id] = companyList[i].name;
@@ -544,10 +395,15 @@ static void fillFieldCounts(void)
 
   for (i = 0; i < ARRAY_SIZE(pgnList); i++)
   {
-    for (j = 0; pgnList[i].fieldList[j].name && j < 80; j++);
-    if (j == 80)
+    for (j = 0; pgnList[i].fieldList[j].name && j < ARRAY_SIZE(pgnList[i].fieldList); j++);
+    if (j == ARRAY_SIZE(pgnList[i].fieldList))
     {
-      logError("Internal PGN %d does not have correct fieldlist.\n", pgnList[i].pgn);
+      logError("Internal error: PGN %d '%s' does not have correct fieldlist.\n", pgnList[i].pgn, pgnList[i].description);
+      exit(2);
+    }
+    if (j == 0 && pgnList[i].known)
+    {
+      logError("Internal error: PGN %d '%s' does not have fields.\n", pgnList[i].pgn, pgnList[i].description);
       exit(2);
     }
     pgnList[i].fieldCount = j;
@@ -564,7 +420,9 @@ void mprintf(const char * format, ...)
 
   va_start(ap, format);
   remain = sizeof(mbuf) - (mp - mbuf) - 1;
-  mp += vsnprintf(mp, remain, format, ap);
+  if (remain > 0) {
+    mp += vsnprintf(mp, remain, format, ap);
+  }
   va_end(ap);
 }
 
@@ -650,11 +508,11 @@ static bool printLatLon(char * name, double resolution, uint8_t * data, size_t b
 
     if (showJson)
     {
-      mprintf("%s\"%s\":%010.7f", getSep(), name, dd);
+      mprintf("%s\"%s\":%10.7f", getSep(), name, dd);
     }
     else
     {
-      mprintf("%s %s = %010.7f", getSep(), name, dd);
+      mprintf("%s %s = %10.7f", getSep(), name, dd);
     }
   }
   else if (showGeo == GEO_DM)
@@ -665,7 +523,7 @@ static bool printLatLon(char * name, double resolution, uint8_t * data, size_t b
     uint64_t remainder = (absVal % RES_LAT_LONG_PRECISION);
     double minutes = (remainder * 60) / (double) RES_LAT_LONG_PRECISION;
 
-    mprintf((showJson ? "%s\"%s\":\"%02u&deg; %06.3f %c\"" : "%s %s = %02ud %06.3f %c")
+    mprintf((showJson ? "%s\"%s\":\"%02u&deg; %6.3f %c\"" : "%s %s = %02ud %6.3f %c")
            , getSep(), name, (uint32_t) degrees, minutes
            , ((resolution == RES_LONGITUDE)
               ? ((value >= 0) ? 'E' : 'W')
@@ -690,7 +548,7 @@ static bool printLatLon(char * name, double resolution, uint8_t * data, size_t b
     if (showJson)
     {
       double dd = (double) value / (double) RES_LAT_LONG_PRECISION;
-      mprintf("%s\"%s_dd\":%010.7f", getSep(), name, dd);
+      mprintf("%s\"%s_dd\":%10.7f", getSep(), name, dd);
     }
   }
   return true;
@@ -781,14 +639,28 @@ static bool printTime(char * name, uint32_t t)
   return true;
 }
 
-static bool printTemperature(char * name, uint16_t t)
+static bool printTemperature(char * name, uint32_t t, uint32_t bits, double resolution)
 {
-  double c = t / 100.0 - 273.15;
+  double k = t * resolution;
+  double c = k - 273.15;
   double f = c * 1.8 + 32;
 
-  if (t >= 0xfffd)
+  if ((bits == 16 && t >= 0xfffd) || (bits == 24 && t >= 0xfffffd))
   {
     return false;
+  }
+
+  if (showSI)
+  {
+    if (showJson)
+    {
+      mprintf("%s\"%s\":%.2f", getSep(), name, k, f);
+    }
+    else
+    {
+      mprintf("%s %s = %.2f K", getSep(), name, k);
+    }
+    return true;
   }
 
   if (showJson)
@@ -799,21 +671,29 @@ static bool printTemperature(char * name, uint16_t t)
   {
     mprintf("%s %s = %.2f C (%.1f F)", getSep(), name, c, f);
   }
+
   return true;
 }
 
-static bool printPressure(char * name, uint16_t v, Field * field)
+static bool printPressure(char * name, uint32_t v, Field * field)
 {
   int32_t pressure;
   double bar;
   double psi;
 
-  if (v >= 0xfffd)
+  if (field->size <= 16)
+  {
+    if (v >= 0xfffd)
+    {
+      return false;
+    }
+  }
+  if (v >= 0xfffffffd)
   {
     return false;
   }
 
-  // There are three types of known pressure: unsigned hectopascal, signed kpa, unsigned kpa.
+  // There are four types of known pressure: unsigned hectopascal, signed kpa, unsigned kpa, unsigned four bytes in pascal.
 
   if (field->hasSign)
   {
@@ -835,6 +715,10 @@ static bool printPressure(char * name, uint16_t v, Field * field)
     case 'k':
     case 'K':
       pressure *= 1000;
+      break;
+    case 'd':
+      pressure /= 10;
+      break;
     }
   }
 
@@ -1046,147 +930,6 @@ static bool printDecimal(char * name, uint8_t * data, size_t startBit, size_t bi
 }
 
 
-/*
- *
- * This is perhaps as good a place as any to explain how CAN messages are layed out by the
- * NMEA. Basically, it's a mess once the bytes are recomposed into bytes (the on-the-wire
- * format is fine).
- *
- * For fields that are aligned on bytes there isn't much of an issue, they appear in our
- * buffers in standard Intel 'least endian' format.
- * For instance the MMSI # 244050447 is, in hex: 0x0E8BEA0F. This will be found in the CAN data as:
- * byte x+0: 0x0F
- * byte x+1: 0xEA
- * byte x+2: 0x8B
- * byte x+3: 0x0e
- *
- * To gather together we loop over the bytes, and keep increasing the magnitude of what we are
- * adding:
- *    for (i = 0, magnitude = 0; i < 4; i++)
- *    {
- *      value += data[i] << magnitude;
- *      magnitude += 8;
- *    }
- *
- * However, when there are two bit fields after each other, lets say A of 2 and then B of 6 bits:
- * then that is layed out MSB first, so the bit mask is 0b11000000 for the first
- * field and 0b00111111 for the second field.
- *
- * This means that if we have a bit field that crosses a byte boundary and does not start on
- * a byte boundary, the bit masks are like this (for a 16 bit field starting at the 3rd bit):
- *
- * 0b00111111 0b11111111 0b11000000
- *     ------   --------   --
- *     000000   11110000   11
- *     543210   32109876   54
- *
- * So we are forced to mask bits 0 and 1 of the first byte. Since we need to process the previous
- * field first, we cannot repeatedly shift bits out of the byte: if we shift left we get the first
- * field first, but in MSB order. We need bit values in LSB order, as the next byte will be more
- * significant. But we can't shift right as that will give us bits in LSB order but then we get the
- * two fields in the wrong order...
- *
- * So for that reason we explicitly test, per byte, how many bits we need and how many we have already
- * used.
- *
- */
-
-static void extractNumber(Field * field, uint8_t * data, size_t startBit, size_t bits, int64_t * value, int64_t * maxValue)
-{
-  bool hasSign = field->hasSign;
-
-  size_t firstBit = startBit;
-  size_t bitsRemaining = bits;
-  size_t magnitude = 0;
-  size_t bitsInThisByte;
-  uint64_t bitMask;
-  uint64_t allOnes;
-  uint64_t valueInThisByte;
-
-  *value = 0;
-  *maxValue = 0;
-
-  if (showBytes)
-  {
-    mprintf("(en f=%s,sb=%u,b=%u) ", field->name, (unsigned int) startBit, (unsigned int) firstBit);
-  }
-
-  while (bitsRemaining)
-  {
-    bitsInThisByte = min(8 - firstBit, bitsRemaining);
-    allOnes = (uint64_t) ((((uint64_t) 1) << bitsInThisByte) - 1);
-
-    //How are bits ordered in bytes for bit fields? There are two ways, first field at LSB or first
-    //field as MSB.
-    //Experimentation, using the 129026 PGN, has shown that the most likely candidate is LSB.
-    bitMask = allOnes << firstBit;
-    valueInThisByte = (*data & bitMask) >> firstBit;
-
-    *value |= valueInThisByte << magnitude;
-    *maxValue |= (int64_t) allOnes << magnitude;
-
-    if (showBytes)
-    {
-      mprintf("(d=%x,bib=%u,fb=%u,msk=%x,v=%x,mag=%x) ", *data, bitsInThisByte, firstBit, (unsigned int)bitMask, (unsigned int)valueInThisByte, (unsigned int)magnitude);
-    }
-
-    magnitude += bitsInThisByte;
-    bitsRemaining -= bitsInThisByte;
-    firstBit += bitsInThisByte;
-    if (firstBit >= 8)
-    {
-      firstBit -= 8;
-      data++;
-    }
-  }
-
-  if (hasSign)
-  {
-    *maxValue >>= 1;
-
-    if (field->offset) /* J1939 Excess-K notation */
-    {
-      *value += field->offset;
-    }
-    else
-    {
-      bool negative = (*value & (((uint64_t) 1) << (bits - 1))) > 0;
-
-      if (negative)
-      {
-        /* Sign extend value for cases where bits < 64 */
-        /* Assume we have bits = 16 and value = -2 then we do: */
-        /* 0000.0000.0000.0000.0111.1111.1111.1101 value    */
-        /* 0000.0000.0000.0000.0111.1111.1111.1111 maxvalue */
-        /* 1111.1111.1111.1111.1000.0000.0000.0000 ~maxvalue */
-        *value |= ~*maxValue;
-      }
-    }
-  }
-
-  if (showBytes)
-  {
-    mprintf("(v=%llx,m=%llx) ", *value, *maxValue);
-  }
-}
-
-static Field * getField(uint32_t pgn, uint32_t field)
-{
-  int index;
-
-  for (index = 0; index < ARRAY_SIZE(pgnList); index++)
-  {
-    if (pgn == pgnList[index].pgn)
-    {
-      if (field > pgnList[index].fieldCount)
-      {
-        return 0;
-      }
-      return &(pgnList[index].fieldList[field]);
-    }
-  }
-  return 0;
-}
 
 static bool printVarNumber(char * fieldName, Pgn * pgn, uint32_t refPgn, Field * field, uint8_t * data, size_t startBit, size_t * bits)
 {
@@ -1252,6 +995,12 @@ static bool printNumber(char * fieldName, Field * field, uint8_t * data, size_t 
     reserved = 0;
   }
 
+  if (fieldName[0] == '#')
+  {
+    logDebug("g_variableFieldRepeat[%d]=%d\n", g_variableFieldIndex, value);
+    g_variableFieldRepeat[g_variableFieldIndex++] = value;
+  }
+
   if (value <= maxValue - reserved)
   {
     if (field->units && field->units[0] == '=')
@@ -1279,8 +1028,8 @@ static bool printNumber(char * fieldName, Field * field, uint8_t * data, size_t 
         mprintf("%s %s = %s", getSep(), fieldName, s);
       }
     }
-    else
-    if (field->resolution == RES_LOOKUP && field->units)
+
+    else if (field->resolution == RES_LOOKUP && field->units)
     {
       char lookfor[20];
       char * s, * e;
@@ -1292,7 +1041,11 @@ static bool printNumber(char * fieldName, Field * field, uint8_t * data, size_t 
         s += strlen(lookfor);
         e = strchr(s, ',');
         e = e ? e : s + strlen(s);
-        if (showJson)
+        if (showJsonValue)
+        {
+          mprintf("%s\"%s\":{\"value\":%"PRId64",\"name\":\"%.*s\"}", getSep(), fieldName, value, (int) (e - s), s);
+        }
+        else if (showJson)
         {
           mprintf("%s\"%s\":\"%.*s\"", getSep(), fieldName, (int) (e - s), s);
         }
@@ -1310,6 +1063,69 @@ static bool printNumber(char * fieldName, Field * field, uint8_t * data, size_t 
         else
         {
           mprintf("%s %s = %"PRId64"", getSep(), fieldName, value);
+        }
+      }
+    }
+
+    else if (field->resolution == RES_BITFIELD && field->units)
+    {
+      char lookfor[20];
+      char * s, * e;
+      unsigned int bit;
+      uint64_t bitValue;
+      char sep;
+
+      logDebug("RES_BITFIELD value %"PRIx64"\n", value);
+      if (showJson)
+      {
+        mprintf("%s\"%s\": ", getSep(), fieldName);
+        sep = '[';
+      }
+      else
+      {
+        mprintf("%s %s =", getSep(), fieldName);
+        sep = ' ';
+      }
+
+      for (bitValue = 1, bit = 0; bitValue <= maxValue; (bitValue *= 2), bit++)
+      {
+        logDebug("RES_BITFIELD is bit %u value %"PRIx64" set %d\n", bit, bitValue, (value & value) >= 0);
+        if ((value & bitValue) != 0)
+        {
+          sprintf(lookfor, ",%u=", bit);
+          s = strstr(field->units, lookfor);
+          if (s)
+          {
+            s += strlen(lookfor);
+            e = strchr(s, ',');
+            e = e ? e : s + strlen(s);
+            if (showJson)
+            {
+              mprintf("%c\"%.*s\"", sep, (int) (e - s), s);
+              sep = ',';
+            }
+            else
+            {
+              mprintf("%c%.*s", sep, (int) (e - s), s);
+              sep = ',';
+            }
+          }
+          else
+          {
+            mprintf("%c\"%"PRIu64"\"", sep, bitValue);
+            sep = ',';
+          }
+        }
+      }
+      if (showJson)
+      {
+        if (sep != '[')
+        {
+          mprintf("]");
+        }
+        else
+        {
+          mprintf("[]");
         }
       }
     }
@@ -1336,11 +1152,20 @@ static bool printNumber(char * fieldName, Field * field, uint8_t * data, size_t 
       }
       if (!m)
       {
+        if (showJson)
+        {
+          mprintf("%s \"%s\":%"PRId64, getSep(), fieldName, value);
+          return true;
+        }
         sprintf(unknownManufacturer, "Unknown Manufacturer %"PRId64, value);
         m = unknownManufacturer;
       }
 
-      if (showJson)
+      if (showJsonValue)
+      {
+        mprintf("%s \"%s\":{\"value\":%"PRId64",\"name\":\"%s\"}", getSep(), fieldName, value, m);
+      }
+      else if (showJson)
       {
         mprintf("%s \"%s\": \"%s\"", getSep(), fieldName, m);
       }
@@ -1365,41 +1190,67 @@ static bool printNumber(char * fieldName, Field * field, uint8_t * data, size_t 
       }
       else
       {
-        int precision = 0;
+        int precision;
         double r;
+        const char * units = field->units;
 
-        a = value * field->resolution;
+        a = (double) value * field->resolution;
 
-        if (field->resolution == RES_DEGREES)
+        precision = 0;
+        for (r = field->resolution; (r > 0.0) && (r < 1.0); r *= 10.0)
         {
-          precision = 1;
+          precision++;
         }
-        else if (field->resolution == RES_DEGREES * 0.0001)
+
+        if (field->resolution == RES_RADIANS)
         {
-          precision = 4;
-        }
-        else
-        {
-          for (r = field->resolution; (r > 0.0) && (r < 1.0); r *= 10.0)
+          units = "rad";
+          if (!showSI)
           {
-            precision++;
+            a *= RadianToDegree;
+            precision -= 3;
+            units = "deg";
           }
         }
+        else if (field->resolution == RES_ROTATION || field->resolution == RES_HIRES_ROTATION)
+        {
+          units = "rad/s";
+          if (!showSI)
+          {
+            a *= RadianToDegree;
+            precision -= 3;
+            units = "deg/s";
+          }
+        }
+        else if (units && showSI)
+        {
+          if (strcmp(units, "kWh") == 0)
+          {
+            a *= 3.6e6; // 1 kWh = 3.6 MJ.
+          }
+          else if (strcmp(units, "Ah") == 0)
+          {
+            a *= 3600.0; // 1 Ah = 3600 C.
+          }
+
+          // Many more to follow, but pgn.h is not yet complete enough...
+        }
+
 
         if (showJson)
         {
           mprintf("%s\"%s\":%.*f", getSep(), fieldName, precision, a);
         }
-        else if (field->units && strcmp(field->units, "m") == 0 && a >= 1000.0)
+        else if (units && strcmp(units, "m") == 0 && a >= 1000.0)
         {
           mprintf("%s %s = %.*f km", getSep(), fieldName, precision + 3, a / 1000);
         }
         else
         {
           mprintf("%s %s = %.*f", getSep(), fieldName, precision, a);
-          if (field->units)
+          if (units)
           {
-            mprintf(" %s", field->units);
+            mprintf(" %s", units);
           }
         }
       }
@@ -1463,7 +1314,7 @@ void setSystemClock(uint16_t currentDate, uint32_t currentTime)
 
   if (prevDate == UINT16_MAX)
   {
-    logDebug("setSytemClock: first time\n");
+    logDebug("setSystemClock: first time\n");
     prevDate = currentDate;
     prevTime = currentTime;
     return;
@@ -1586,395 +1437,6 @@ static void print_ascii_json_escaped(uint8_t *data, int len)
   }
 }
 
-
-bool printPgn(int index, int subIndex, RawMessage * msg)
-{
-  uint8_t * dataStart;
-  uint8_t * data;
-  size_t size;
-  uint8_t * dataEnd;
-  size_t i;
-  Field field;
-  size_t bits;
-  size_t bytes;
-  size_t startBit;
-  Pgn * pgn;
-  int      repetition = 1;
-  uint16_t valueu16;
-  uint32_t valueu32;
-  uint16_t currentDate = UINT16_MAX;
-  uint32_t currentTime = UINT32_MAX;
-  char fieldName[60];
-  bool r;
-  bool matchedFixedField;
-  bool hasFixedField;
-  uint32_t refPgn = 0;
-
-  if (!device[msg->src])
-  {
-    return false;
-  }
-  dataStart = device[msg->src]->packetList[index].data;
-  if (!dataStart)
-  {
-    return false;
-  }
-  size = device[msg->src]->packetList[index].size;
-  dataEnd = dataStart + size;
-
-  if (!pgnList[index].unknownPgn)
-  {
-    for (;(index < ARRAY_SIZE(pgnList)) && (msg->pgn == pgnList[index].pgn); index++)
-    {
-      matchedFixedField = true;
-      hasFixedField = false;
-
-      /* There is a next index that we can use as well. We do so if the 'fixed' fields don't match */
-
-      pgn = &pgnList[index];
-
-      for (i = 0, startBit = 0, data = dataStart; i < pgn->fieldCount; i++)
-      {
-        field = pgn->fieldList[i];
-        if (!field.name || !field.size)
-        {
-          break;
-        }
-
-        bits = field.size;
-
-        if (field.units && field.units[0] == '=')
-        {
-          int64_t value, desiredValue;
-          int64_t maxValue;
-
-          hasFixedField = true;
-          extractNumber(&field, data, startBit, field.size, &value, &maxValue);
-          desiredValue = strtol(field.units + 1, 0, 10);
-          if (value != desiredValue)
-          {
-            matchedFixedField = false;
-            break;
-          }
-        }
-        startBit += bits;
-        data += startBit / 8;
-        startBit %= 8;
-      }
-      if (! hasFixedField || (hasFixedField && matchedFixedField))
-      {
-        break;
-      }
-    }
-  }
-
-  if ((index >= ARRAY_SIZE(pgnList)) || (msg->pgn != pgnList[index].pgn && !pgnList[index].unknownPgn))
-  {
-    index = 0;
-  }
-
-  pgn = &pgnList[index];
-
-  if (showData)
-  {
-    FILE * f = stdout;
-    char c = ' ';
-
-    if (showJson)
-    {
-      f = stderr;
-    }
-
-    fprintf(f, "%s %u %3u %3u %6u %s: ", msg->timestamp, msg->prio, msg->src, msg->dst, msg->pgn, pgn->description);
-    for (i = 0; i < size; i++)
-    {
-      fprintf(f, " %2.02X", dataStart[i]);
-    }
-    putc('\n', f);
-
-    fprintf(f, "%s %u %3u %3u %6u %s: ", msg->timestamp, msg->prio, msg->src, msg->dst, msg->pgn, pgn->description);
-    for (i = 0; i < size; i++)
-    {
-      fprintf(f, "  %c", isalnum(dataStart[i]) ? dataStart[i] : '.');
-    }
-    putc('\n', f);
-  }
-
-  if (showJson)
-  {
-    if (pgn->camelDescription)
-    {
-      mprintf("\"%s\":", pgn->camelDescription);
-    }
-    mprintf("{\"timestamp\":\"%s\",\"prio\":%u,\"src\":%u,\"dst\":%u,\"pgn\":%u,\"description\":\"%s\"", msg->timestamp, msg->prio, msg->src, msg->dst, msg->pgn, pgn->description);
-    braceCount = 1;
-    sep = ",\"fields\":{";
-  }
-  else
-  {
-    mprintf("%s %u %3u %3u %6u %s:", msg->timestamp, msg->prio, msg->src, msg->dst, msg->pgn, pgn->description);
-    sep = " ";
-  }
-
-  for (i = 0, startBit = 0, data = dataStart; data < dataEnd; i++)
-  {
-    r = true;
-    field = pgn->fieldList[i];
-    if (!field.name)
-    {
-      if (pgn->repeatingFields)
-      {
-        i = i - pgn->repeatingFields;
-        field = pgn->fieldList[i];
-        repetition++;
-      }
-      else
-      {
-        break;
-      }
-    }
-
-    strcpy(fieldName, field.camelName ? field.camelName : field.name);
-    if (repetition > 1)
-    {
-      strcat(fieldName, field.camelName ? "_" : " ");
-      sprintf(fieldName + strlen(fieldName), "%u", repetition);
-    }
-
-    bits  = field.size;
-    bytes = (bits + 7) / 8;
-    bytes = min(bytes, (size_t) (dataEnd - data));
-    bits  = min(bytes * 8, bits);
-
-    if (showBytes)
-    {
-      mprintf("\ndecode %s offset=%u startBit=%u bits=%u bytes=%u:", field.name, data - dataStart, startBit, bits, bytes);
-    }
-
-    if (strcmp(fieldName, "PGN") == 0)
-    {
-      refPgn = data[0] + (data[1] << 8) + (data[2] << 16);
-      if (showBytes)
-      {
-        mprintf("refPgn=%u ", refPgn);
-      }
-    }
-
-    if (strcmp(fieldName, "Reserved") == 0)
-    {
-      // Skipping reserved fields. Unfortunately we have some cases now
-      // where they are zero. Some AIS devices (SRT) produce an 8 bit long
-      // nav status, others just a four bit one.
-    }
-    else if (field.resolution < 0.0)
-    {
-      int len;
-      int k;
-
-      /* These fields have only been found to start on byte boundaries,
-       * making their location easier
-       */
-      if (field.resolution == RES_STRINGLZ)
-      {
-        len = *data++;
-        bytes--;
-        goto ascii_string;
-      }
-
-      if (field.resolution == RES_STRINGLAU)
-      {
-        int control;
-
-        len = *data++;
-        bytes--;
-        control = *data++;
-        bytes--;
-        if (control == 0)
-        {
-          logError("Unhandled UNICODE string in PGN\n");
-        }
-        goto ascii_string;
-      }
-
-      if (field.resolution == RES_ASCII)
-      {
-        len = (int) bytes;
-        unsigned char lastbyte = data[len - 1];
-
-        if (lastbyte == 0xff || lastbyte == ' ' || lastbyte == 0 || lastbyte == '@')
-        {
-          while (len > 0 && (data[len - 1] == lastbyte))
-          {
-            len--;
-          }
-        }
-
-ascii_string:
-        if (showBytes)
-        {
-          for (k = 0; k < len; k++)
-          {
-            mprintf("%02x ", data[k]);
-          }
-        }
-
-        if (showJson)
-        {
-          mprintf("%s\"%s\":\"", getSep(), fieldName);
-        }
-        else
-        {
-          mprintf("%s %s = ", getSep(), fieldName);
-        }
-
-        if (showJson)
-        {
-          print_ascii_json_escaped(data, len);
-        }
-        else
-        {
-          for (k = 0; k < len; k++)
-          {
-            if (data[k] == 0xff)
-            {
-              break;
-            }
-            if (data[k] >= ' ' && data[k] <= '~')
-            {
-              mprintf("%c", data[k]);
-            }
-          }
-        }
-
-        if (showJson)
-        {
-          mprintf("\"");
-        }
-
-      }
-      else if (field.resolution == RES_STRING)
-      {
-        int len;
-        if (*data == 0x02)
-        {
-          data++;
-          for (len = 0; data + len < dataEnd && data[len] != 0x01; len++);
-          bytes = len + 1;
-        }
-        else if (*data > 0x02)
-        {
-          bytes = *data++;
-          bytes--; /* Compensate for that we've already increased data by 1 */
-          if (*data == 0x01)
-          {
-            data++;
-            bytes--;
-          }
-          len = bytes - 1;
-        }
-        else
-        {
-          bytes = 1;
-          len = 0;
-        }
-        if (len)
-        {
-          if (showJson)
-          {
-            mprintf("%s\"%s\":\"%.*s\"", getSep(), fieldName, (int) len, data);
-          }
-          else
-          {
-            mprintf("%s %s = %.*s", getSep(), fieldName, (int) len, data);
-          }
-        }
-        bits = BYTES(bytes);
-      }
-      else if (field.resolution == RES_LONGITUDE || field.resolution == RES_LATITUDE)
-      {
-        printLatLon(fieldName, field.resolution, data, bytes);
-      }
-      else if (field.resolution == RES_DATE)
-      {
-        memcpy((void *) &valueu16, data, 2);
-        printDate(fieldName, valueu16);
-        currentDate = valueu16;
-      }
-      else if (field.resolution == RES_TIME)
-      {
-        memcpy((void *) &valueu32, data, 4);
-        printTime(fieldName, valueu32);
-        currentTime = valueu32;
-      }
-      else if (field.resolution == RES_TEMPERATURE)
-      {
-        memcpy((void *) &valueu16, data, 2);
-        printTemperature(fieldName, valueu16);
-      }
-      else if (field.resolution == RES_PRESSURE)
-      {
-        memcpy((void *) &valueu16, data, 2);
-        printPressure(fieldName, valueu16, &field);
-      }
-      else if (field.resolution == RES_6BITASCII)
-      {
-        print6BitASCIIText(fieldName, data, startBit, bits);
-      }
-      else if (field.resolution == RES_DECIMAL)
-      {
-        printDecimal(fieldName, data, startBit, bits);
-      }
-      else if (bits == LEN_VARIABLE)
-      {
-        printVarNumber(fieldName, pgn, refPgn, &field, data, startBit, &bits);
-      }
-      else if (bits > BYTES(8))
-      {
-        printHex(fieldName, data, startBit, bits);
-      }
-      else if (field.resolution == RES_INTEGER
-            || field.resolution == RES_LOOKUP
-            || field.resolution == RES_BINARY
-            || field.resolution == RES_MANUFACTURER
-              )
-      {
-        printNumber(fieldName, &field, data, startBit, bits);
-      }
-      else
-      {
-        logError("Unknown resolution %f for %s\n", field.resolution, fieldName);
-      }
-    }
-    else if (field.resolution > 0.0)
-    {
-      printNumber(fieldName, &field, data, startBit, bits);
-    }
-    if (!r)
-    {
-      return false;
-    }
-
-    startBit += bits;
-    data += startBit / 8;
-    startBit %= 8;
-  }
-
-  if (showJson)
-  {
-    for (;braceCount > 0; braceCount--)
-    {
-      mprintf("}");
-    }
-  }
-  mprintf("\n");
-
-  if (msg->pgn == 126992 && currentDate < UINT16_MAX && currentTime < UINT32_MAX && clockSrc == msg->src)
-  {
-    setSystemClock(currentDate, currentTime);
-  }
-  return r;
-}
-
 void printPacket(size_t index, size_t unknownIndex, RawMessage * msg)
 {
   size_t fastPacketIndex;
@@ -1986,10 +1448,7 @@ void printPacket(size_t index, size_t unknownIndex, RawMessage * msg)
   if (!device[msg->src])
   {
     heapSize += sizeof(DevicePackets);
-    if (showBytes)
-    {
-      logInfo("New device at address %u (heap %zu bytes)\n", msg->src, heapSize);
-    }
+    logDebug("New device at address %u (heap %zu bytes)\n", msg->src, heapSize);
     device[msg->src] = calloc(1, sizeof(DevicePackets));
     if (!device[msg->src])
     {
@@ -2000,7 +1459,7 @@ void printPacket(size_t index, size_t unknownIndex, RawMessage * msg)
 
   if (!packet->data)
   {
-    packet->allocSize = max(min(pgn->size, 8) + FASTPACKET_BUCKET_N_SIZE, msg->len);
+    packet->allocSize = max(max(pgn->size, 8) + FASTPACKET_BUCKET_N_SIZE, msg->len);
     heapSize += packet->allocSize;
     logInfo("New PGN %u for device %u (heap %zu bytes)\n", pgn->pgn, msg->src, heapSize);
     packet->data = malloc(packet->allocSize);
@@ -2015,7 +1474,6 @@ void printPacket(size_t index, size_t unknownIndex, RawMessage * msg)
     if (packet->allocSize < msg->len)
     {
       heapSize += msg->len - packet->allocSize;
-      packet->data = realloc(packet->data, msg->len);
       logDebug("Resizing buffer for PGN %u device %u to accomodate %u bytes (heap %zu bytes)\n", pgn->pgn, msg->src, msg->len, heapSize);
       packet->data = realloc(packet->data, msg->len);
       if (!packet->data)
@@ -2037,7 +1495,7 @@ void printPacket(size_t index, size_t unknownIndex, RawMessage * msg)
 
     if (bucket == 0)
     {
-      size_t newSize = msg->data[FASTPACKET_SIZE] + FASTPACKET_BUCKET_N_SIZE;
+      size_t newSize = ((size_t) msg->data[FASTPACKET_SIZE]) + FASTPACKET_BUCKET_N_SIZE;
 
       if (packet->allocSize < newSize)
       {
@@ -2087,38 +1545,7 @@ void printPacket(size_t index, size_t unknownIndex, RawMessage * msg)
           );
   }
 
-  /*
-   * If there are multiple PGN descriptions we have to find the matching
-   * one.
-   */
-
-  for (subIndex = index; subIndex < ARRAY_SIZE(pgnList) && (msg->pgn == pgnList[subIndex].pgn); subIndex++)
-  {
-    if (printPgn(index, subIndex, msg)) /* Only the really matching ones will actually return true */
-    {
-      if (index != subIndex)
-      {
-        logDebug("PGN %d matches version %zu\n", msg->pgn, subIndex - index);
-      }
-      mwrite(stdout);
-      return;
-    }
-    else
-    {
-      mreset();
-    }
-  }
-
-  logDebug("PGN %d handled via index %zu\n", msg->pgn, unknownIndex);
-  if (printPgn(unknownIndex, unknownIndex, msg))
-  {
-    mwrite(stdout);
-  }
-  else
-  {
-    mreset();
-  }
-
+  printPgn(msg, packet->data, packet->size, showData, showJson);
 }
 
 bool printCanFormat(RawMessage * msg)
@@ -2177,7 +1604,11 @@ static void explainPGN(Pgn pgn)
 
   printf("PGN: %d / %08o / %05X - %u - %s\n\n", pgn.pgn, pgn.pgn, pgn.pgn, pgn.size, pgn.description);
 
-  if (pgn.repeatingFields)
+  if (pgn.repeatingFields >= 100)
+  {
+    printf("     The last %u and %u fields repeat until the data is exhausted.\n\n", pgn.repeatingFields % 100, pgn.repeatingFields / 100);
+  }
+  else if (pgn.repeatingFields)
   {
     printf("     The last %u fields repeat until the data is exhausted.\n\n", pgn.repeatingFields);
   }
@@ -2199,15 +1630,6 @@ static void explainPGN(Pgn pgn)
     if (f.units && f.units[0] == '=')
     {
       printf("                  Match: %s\n", &f.units[1]);
-    }
-    else if (f.units && strcmp(f.units, "deg/s") == 0)
-    {
-      printf("                  Units: rad/s\n");
-    }
-    else if (f.resolution == RES_DEGREES
-     || f.resolution == RES_DEGREES * 0.0001)
-    {
-      printf("                  Units: rad\n");
     }
     else if (f.units && f.units[0] != ',')
     {
@@ -2237,12 +1659,6 @@ static void explainPGN(Pgn pgn)
         }
       }
     }
-    else if (f.resolution == RES_DEGREES
-          || f.resolution == RES_DEGREES * 0.0001)
-    {
-      printf("                  Type: Angle\n");
-      printf("                  Resolution: %g\n", f.resolution / RadianToDegree);
-    }
     else if (f.resolution != 1.0)
     {
       printf("                  Resolution: %g\n", f.resolution);
@@ -2253,7 +1669,7 @@ static void explainPGN(Pgn pgn)
       printf("                  Offset: %d\n", f.offset);
     }
 
-    if (f.resolution == RES_LOOKUP && f.units && f.units[0] == ',')
+    if ((f.resolution == RES_LOOKUP || f.resolution == RES_BITFIELD) && f.units && f.units[0] == ',')
     {
       char * s, * e;
 
@@ -2268,6 +1684,7 @@ static void explainPGN(Pgn pgn)
         }
       }
     }
+
   }
 
   printf("\n\n");
@@ -2303,11 +1720,19 @@ static void explainPGNXML(Pgn pgn)
   printf("</Description>\n"
          "       <Complete>%s</Complete>\n"
          "       <Length>%u</Length>\n"
-         "       <RepeatingFields>%u</RepeatingFields>\n"
          , (pgn.known ? "true" : "false")
          , pgn.size
-         , pgn.repeatingFields
          );
+
+  if (pgn.repeatingFields >= 100)
+  {
+    printf("       <RepeatingFieldSet1>%u</RepeatingFieldSet1>\n", pgn.repeatingFields % 100);
+    printf("       <RepeatingFieldSet2>%u</RepeatingFieldSet2>\n", pgn.repeatingFields / 100);
+  }
+  else
+  {
+    printf("       <RepeatingFields>%u</RepeatingFields>\n", pgn.repeatingFields);
+  }
 
 
 
@@ -2341,15 +1766,6 @@ static void explainPGNXML(Pgn pgn)
       {
         printf("           <Match>%s</Match>\n", &f.units[1]);
       }
-      else if (f.units && strcmp(f.units, "deg/s") == 0)
-      {
-        printf("           <Units>rad/s</Units>\n");
-      }
-      else if (f.resolution == RES_DEGREES
-       || f.resolution == RES_DEGREES * 0.0001)
-      {
-        printf("           <Units>rad</Units>\n");
-      }
       else if (f.units && f.units[0] != ',')
       {
         printf("           <Units>%s</Units>\n", f.units);
@@ -2377,11 +1793,6 @@ static void explainPGNXML(Pgn pgn)
             printf("                  <Resolution>%.7f</Resolution>\n", 1e-7);
           }
         }
-      }
-      else if (f.resolution == RES_DEGREES)
-      {
-        printf("           <Type>Angle</Type>\n");
-        printf("           <Resolution>%g</Resolution>\n", f.resolution / RadianToDegree);
       }
       else if (f.resolution != 1.0)
       {
@@ -2416,6 +1827,31 @@ static void explainPGNXML(Pgn pgn)
 
         printf("           </EnumValues>\n");
       }
+
+      if (f.resolution == RES_BITFIELD && f.units && f.units[0] == ',')
+      {
+        char * s, * e, * p;
+
+        printf("           <EnumBitValues>\n");
+
+        for (s = f.units + 1;; s = e + 1)
+        {
+          e = strchr(s, ',');
+          e = e ? e : s + strlen(s);
+          p = strchr(s, '=');
+          if (p)
+          {
+            printf("             <EnumPair Bit='%.*s' Name='%.*s' />\n", (int) (p - s), s, (int) (e - (p + 1)), p + 1);
+          }
+          if (!*e)
+          {
+            break;
+          }
+        }
+
+        printf("           </EnumBitValues>\n");
+      }
+
       if (f.resolution == RES_STRINGLZ || f.resolution == RES_STRINGLAU)
       {
         showBitOffset = false; // From here on there is no good bitoffset to be printed
@@ -2512,7 +1948,6 @@ void explainXML(void)
   printf("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
     "<!--\n"COPYRIGHT"\n-->\n"
     "<PGNDefinitions xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\" Version=\"0.1\">\n"
-    "  <Date>"PROGRAM_DATE"</Date>\n"
     "  <Comment>See https://github.com/canboat/canboat for the full source code</Comment>\n"
     "  <CreatorCode>Canboat NMEA2000 Analyzer</CreatorCode>\n"
     "  <License>GPL v3</License>\n"
@@ -2529,4 +1964,431 @@ void explainXML(void)
 
   printf("  </PGNs>\n"
     "</PGNDefinitions>\n");
+}
+
+bool printPgn(RawMessage* msg, uint8_t *dataStart, int length, bool showData, bool showJson) {
+  Pgn *pgn;
+
+  uint8_t * data;
+
+  uint8_t * dataEnd = dataStart + length;
+  size_t i;
+  Field field;
+  size_t bits;
+  size_t bytes;
+  size_t startBit;
+  int      repetition = 0;
+  uint16_t valueu16;
+  uint32_t valueu32;
+  uint16_t currentDate = UINT16_MAX;
+  uint32_t currentTime = UINT32_MAX;
+  char fieldName[60];
+  bool r;
+  uint32_t refPgn = 0;
+  uint32_t variableFieldCount[2]; // How many variable fields over all repetitions, indexed by group
+  uint32_t variableFields[2];     // How many variable fields per repetition, indexed by group
+  size_t variableFieldStart;
+
+  if (!msg) {
+    return false;
+  }
+  pgn  = getMatchingPgn(msg->pgn, dataStart, length);
+  if (!pgn) {
+    pgn = pgnList;
+  }
+
+  if (showData)
+  {
+    FILE * f = stdout;
+    char c = ' ';
+
+    if (showJson)
+    {
+      f = stderr;
+    }
+
+    fprintf(f, "%s %u %3u %3u %6u %s: ", msg->timestamp, msg->prio, msg->src, msg->dst, msg->pgn, pgn->description);
+    for (i = 0; i < length; i++)
+    {
+      fprintf(f, " %2.02X", dataStart[i]);
+    }
+    putc('\n', f);
+
+    fprintf(f, "%s %u %3u %3u %6u %s: ", msg->timestamp, msg->prio, msg->src, msg->dst, msg->pgn, pgn->description);
+    for (i = 0; i < length; i++)
+    {
+      fprintf(f, "  %c", isalnum(dataStart[i]) ? dataStart[i] : '.');
+    }
+    putc('\n', f);
+  }
+  if (showJson)
+  {
+    if (pgn->camelDescription)
+    {
+      mprintf("\"%s\":", pgn->camelDescription);
+    }
+    mprintf("{\"timestamp\":\"%s\",\"prio\":%u,\"src\":%u,\"dst\":%u,\"pgn\":%u,\"description\":\"%s\"", msg->timestamp, msg->prio, msg->src, msg->dst, msg->pgn, pgn->description);
+    strcpy(closingBraces, "}");
+    sep = ",\"fields\":{";
+  }
+  else
+  {
+    mprintf("%s %u %3u %3u %6u %s:", msg->timestamp, msg->prio, msg->src, msg->dst, msg->pgn, pgn->description);
+    sep = " ";
+  }
+
+  g_variableFieldRepeat[0] = 0;
+  g_variableFieldRepeat[1] = 0;
+  g_variableFieldIndex = 0;
+  if (pgn->repeatingFields >= 100)
+  {
+    variableFieldCount[0] = pgn->repeatingFields % 100;
+    variableFieldCount[1] = pgn->repeatingFields / 100;
+  }
+  else
+  {
+    variableFieldCount[0] = pgn->repeatingFields % 100;
+    variableFieldCount[1] = 0;
+  }
+  variableFieldStart = pgn->fieldCount - variableFieldCount[0] - variableFieldCount[1];
+  logDebug("fieldCount=%d variableFieldStart=%d\n", pgn->fieldCount, variableFieldStart);
+
+  for (i = 0, startBit = 0, data = dataStart; data < dataEnd; i++)
+  {
+    Field* field;
+    r = true;
+
+    if (variableFieldCount[0] && i == variableFieldStart && repetition == 0)
+    {
+      repetition = 1;
+      if (showJson)
+      {
+        mprintf("%s\"list\":[{", getSep());
+        strcat(closingBraces, "]}");
+        sep = "";
+      }
+      // Only now is g_variableFieldRepeat set via values for parameters starting with '# of ...'
+      variableFields[0] = variableFieldCount[0] * g_variableFieldRepeat[0];
+      variableFields[1] = variableFieldCount[1] * g_variableFieldRepeat[1];
+    }
+    if (repetition)
+    {
+      if (variableFields[0])
+      {
+        if (showBytes)
+        {
+          mprintf("\ni=%d fs=%d vf=%d", i, variableFieldStart, variableFields[0]);
+        }
+        if (i == variableFieldStart + variableFieldCount[0])
+        {
+          i = variableFieldStart;
+          repetition++;
+          if (showJson)
+          {
+            mprintf("},{");
+            sep = "";
+          }
+        }
+        variableFields[0]--;
+        if (variableFields[0] == 0)
+        {
+          variableFieldStart += variableFieldCount[0];
+        }
+      }
+      else if (variableFields[1])
+      {
+        if (variableFields[1] == variableFieldCount[1] * g_variableFieldRepeat[1])
+        {
+          repetition = 0;
+        }
+        if (i == variableFieldStart + variableFieldCount[1])
+        {
+          i = variableFieldStart;
+          repetition++;
+          if (showJson)
+          {
+            mprintf("},{");
+            sep = "";
+          }
+        }
+        variableFields[1]--;
+      }
+      else
+      {
+        break;
+      }
+    }
+
+    field = &pgn->fieldList[i];
+
+    if (!field->camelName && !field->name)
+    {
+      logDebug("PGN %u has unknown bytes at end: %u\n", msg->pgn, dataEnd - data);
+      break;
+    }
+
+    strcpy(fieldName, field->camelName ? field->camelName : field->name);
+    if (repetition >= 1 && !showJson)
+    {
+      strcat(fieldName, field->camelName ? "_" : " ");
+      sprintf(fieldName + strlen(fieldName), "%u", repetition);
+    }
+
+    bits  = field->size;
+    bytes = (bits + 7) / 8;
+    bytes = min(bytes, (size_t) (dataEnd - data));
+    bits  = min(bytes * 8, bits);
+
+    if (showBytes)
+    {
+      mprintf("\ndecode %s offset=%u startBit=%u bits=%u bytes=%u:", field->name, data - dataStart, startBit, bits, bytes);
+    }
+
+    if (strcmp(fieldName, "PGN") == 0)
+    {
+      refPgn = data[0] + (data[1] << 8) + (data[2] << 16);
+      if (showBytes)
+      {
+        mprintf("refPgn=%u ", refPgn);
+      }
+    }
+
+    if (strcmp(fieldName, "Reserved") == 0)
+    {
+      // Skipping reserved fields. Unfortunately we have some cases now
+      // where they are zero. Some AIS devices (SRT) produce an 8 bit long
+      // nav status, others just a four bit one.
+    }
+    else if (field->resolution < 0.0)
+    {
+      int len;
+      int k;
+
+      /* These fields have only been found to start on byte boundaries,
+       * making their location easier
+       */
+      if (field->resolution == RES_STRINGLZ)
+      {
+        len = *data++;
+        bytes--;
+        goto ascii_string;
+      }
+
+      if (field->resolution == RES_STRINGLAU)
+      {
+        int control;
+
+        len = *data++;
+        bytes--;
+        control = *data++;
+        bytes--;
+        if (control == 0)
+        {
+          logError("Unhandled UNICODE string in PGN\n");
+        }
+        goto ascii_string;
+      }
+
+      if (field->resolution == RES_ASCII)
+      {
+        len = (int) bytes;
+        unsigned char lastbyte = data[len - 1];
+
+        if (lastbyte == 0xff || lastbyte == ' ' || lastbyte == 0 || lastbyte == '@')
+        {
+          while (len > 0 && (data[len - 1] == lastbyte))
+          {
+            len--;
+          }
+        }
+
+ascii_string:
+        if (showBytes)
+        {
+          for (k = 0; k < len; k++)
+          {
+            mprintf("%02x ", data[k]);
+          }
+        }
+
+        if (showJson)
+        {
+          mprintf("%s\"%s\":\"", getSep(), fieldName);
+        }
+        else
+        {
+          mprintf("%s %s = ", getSep(), fieldName);
+        }
+
+        if (showJson)
+        {
+          print_ascii_json_escaped(data, len);
+        }
+        else
+        {
+          for (k = 0; k < len; k++)
+          {
+            if (data[k] == 0xff)
+            {
+              break;
+            }
+            if (data[k] >= ' ' && data[k] <= '~')
+            {
+              mprintf("%c", data[k]);
+            }
+          }
+        }
+
+        if (showJson)
+        {
+          mprintf("\"");
+        }
+
+      }
+      else if (field->resolution == RES_STRING)
+      {
+        int len;
+        if (*data == 0x02)
+        {
+          data++;
+          for (len = 0; data + len < dataEnd && data[len] != 0x01; len++);
+          bytes = len + 1;
+        }
+        else if (*data > 0x02)
+        {
+          bytes = *data++;
+          bytes--; /* Compensate for that we've already increased data by 1 */
+          if (*data == 0x01)
+          {
+            data++;
+            bytes--;
+          }
+          len = bytes - 1;
+        }
+        else
+        {
+          bytes = 1;
+          len = 0;
+        }
+        if (len)
+        {
+          if (showJson)
+          {
+            mprintf("%s\"%s\":\"%.*s\"", getSep(), fieldName, (int) len, data);
+          }
+          else
+          {
+            mprintf("%s %s = %.*s", getSep(), fieldName, (int) len, data);
+          }
+        }
+        bits = BYTES(bytes);
+      }
+      else if (field->resolution == RES_LONGITUDE || field->resolution == RES_LATITUDE)
+      {
+        printLatLon(fieldName, field->resolution, data, bytes);
+      }
+      else if (field->resolution == RES_DATE)
+      {
+        memcpy((void *) &valueu16, data, 2);
+        printDate(fieldName, valueu16);
+        currentDate = valueu16;
+      }
+      else if (field->resolution == RES_TIME)
+      {
+        memcpy((void *) &valueu32, data, 4);
+        printTime(fieldName, valueu32);
+        currentTime = valueu32;
+      }
+      else if (field->resolution == RES_PRESSURE)
+      {
+        valueu32 = data[0] + (data[1] << 8);
+        printPressure(fieldName, valueu32, field);
+      }
+      else if (field->resolution == RES_PRESSURE_HIRES)
+      {
+        valueu32 = data[0] + (data[1] << 8) + (data[2] << 16) + (data[3] << 24);
+        printPressure(fieldName, valueu32, field);
+      }
+      else if (field->resolution == RES_TEMPERATURE)
+      {
+        valueu32 = data[0] + (data[1] << 8);
+        printTemperature(fieldName, valueu32, 16, 0.01);
+      }
+      else if (field->resolution == RES_TEMPERATURE_HIGH)
+      {
+        valueu32 = data[0] + (data[1] << 8);
+        printTemperature(fieldName, valueu32, 16, 0.1);
+      }
+      else if (field->resolution == RES_TEMPERATURE_HIRES)
+      {
+        valueu32 = data[0] + (data[1] << 8) + (data[2] << 16);
+        printTemperature(fieldName, valueu32, 24, 0.001);
+      }
+      else if (field->resolution == RES_6BITASCII)
+      {
+        print6BitASCIIText(fieldName, data, startBit, bits);
+      }
+      else if (field->resolution == RES_DECIMAL)
+      {
+        printDecimal(fieldName, data, startBit, bits);
+      }
+      else if (bits == LEN_VARIABLE)
+      {
+        printVarNumber(fieldName, pgn, refPgn, field, data, startBit, &bits);
+      }
+      else if (bits > BYTES(8))
+      {
+        printHex(fieldName, data, startBit, bits);
+      }
+      else if (field->resolution == RES_INTEGER
+            || field->resolution == RES_LOOKUP
+            || field->resolution == RES_BITFIELD
+            || field->resolution == RES_BINARY
+            || field->resolution == RES_MANUFACTURER
+              )
+      {
+        printNumber(fieldName, field, data, startBit, bits);
+      }
+      else
+      {
+        logError("Unknown resolution %f for %s\n", field->resolution, fieldName);
+      }
+    }
+    else if (field->resolution > 0.0)
+    {
+      printNumber(fieldName, field, data, startBit, bits);
+    }
+    if (!r)
+    {
+      return false;
+    }
+
+    startBit += bits;
+    data += startBit / 8;
+    startBit %= 8;
+  }
+
+  if (showJson)
+  {
+    for (i = strlen(closingBraces); i;)
+    {
+      mprintf("%c", closingBraces[--i]);
+    }
+  }
+  mprintf("\n");
+
+  if (r)
+  {
+    mwrite(stdout);
+  }
+  else
+  {
+    mreset();
+  }
+
+  if (msg->pgn == 126992 && currentDate < UINT16_MAX && currentTime < UINT32_MAX && clockSrc == msg->src)
+  {
+    setSystemClock(currentDate, currentTime);
+  }
+  return r;
 }

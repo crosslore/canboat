@@ -1,5 +1,5 @@
 #
-# (C) 2009-2014, Kees Verruijt, Harlingen, The Netherlands.
+# (C) 2009-2015, Kees Verruijt, Harlingen, The Netherlands.
 #
 # This file is part of CANboat.
 #
@@ -21,16 +21,15 @@ PLATFORM=$(shell uname | tr '[A-Z]' '[a-z]')-$(shell uname -m)
 TARGETDIR=../rel/$(PLATFORM)
 ANALYZER=$(TARGETDIR)/analyzer
 TARGETS=$(ANALYZER)
-CFLAGS=-O3
 XMLFILE=pgns.xml
 JSONFILE=pgns.json
 
 all: $(TARGETS)
 
-$(ANALYZER): analyzer.c analyzer.h pgn.h ../common/common.c ../common/common.h Makefile
-	$(CC) $(CFLAGS) -o $(ANALYZER) -I../common analyzer.c ../common/common.c $(LDLIBS$(LDLIBS-$(@)))
+$(ANALYZER): analyzer.c pgn.c analyzer.h pgn.h ../common/common.c ../common/common.h Makefile
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $(ANALYZER) -I../common pgn.c analyzer.c ../common/common.c $(LDLIBS$(LDLIBS-$(@)))
 
-json: $(ANALYZER)
+json: $(ANALYZER) pgns2json.xslt
 	$(ANALYZER) -explain-xml >$(XMLFILE) && xsltproc pgns2json.xslt $(XMLFILE) >$(JSONFILE)
 
 clean:
