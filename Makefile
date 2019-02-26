@@ -15,7 +15,7 @@ SYSCONFDIR=$(PREFIX)/etc
 
 PLATFORM=$(shell uname | tr '[A-Z]' '[a-z]')-$(shell uname -m)
 OS=$(shell uname -o 2>&1)
-SUBDIRS= actisense-serial analyzer n2kd nmea0183 ip group-function candump2analyzer socketcan-writer
+SUBDIRS= actisense-serial analyzer n2kd nmea0183 ip group-function candump2analyzer socketcan-writer ikonvert-serial
 
 MKDIR = mkdir -p
 
@@ -32,25 +32,28 @@ all:	bin
 bin:	rel/$(PLATFORM)
 
 rel/$(PLATFORM):
-	$(MKDIR) -p rel/$(PLATFORM)
+	$(MKDIR) rel/$(PLATFORM)
 
 clean:
 	for dir in $(SUBDIRS); do $(MAKE) -C $$dir clean; done
 	
 install: rel/$(PLATFORM)/analyzer $(DESTDIR)$(BINDIR) $(DESTDIR)$(CONFDIR)
-	for i in rel/$(PLATFORM)/* util/* */*_monitor; do f=`basename $$i`; rm -f $(DESTDIR)$(BINDIR)/$$f; cp $$i $(DESTDIR)$(BINDIR); done
+	for i in rel/$(PLATFORM)/* util/* */*_monitor; do f=`basename $$i`; echo $$f; rm -f $(DESTDIR)$(BINDIR)/$$f; cp $$i $(DESTDIR)$(BINDIR); done
 	for i in config/*; do install -g $(ROOT_GID) -o $(ROOT_UID) -m $(ROOT_MOD) $$i $(DESTDIR)$(CONFDIR); done
-	-killall -9 actisense-serial n2kd socketcan-writer || echo 'No running processes killed'
+	-killall -9 actisense-serial ikonvert-serial n2kd socketcan-writer || echo 'No running processes killed'
 
 zip:
 	(cd rel; zip -r ../packetlogger_`date +%Y%m%d`.zip *)
 	./rel/$(PLATFORM)/analyzer -explain > packetlogger_`date +%Y%m%d`_explain.txt
 	./rel/$(PLATFORM)/analyzer -explain-xml > packetlogger_`date +%Y%m%d`_explain.xml
 
-.PHONY : $(SUBDIRS) clean install zip bin
+format:
+	for file in */*.c */*.h; do clang-format -i $$file; done
+
+.PHONY : $(SUBDIRS) clean install zip bin format
 
 $(DESTDIR)$(BINDIR):
-	$(MKDIR) -p $(DESTDIR)$(BINDIR)
+	$(MKDIR) $(DESTDIR)$(BINDIR)
 
 $(DESTDIR)$(CONFDIR):
-	$(MKDIR) -p $(DESTDIR)$(CONFDIR)
+	$(MKDIR) $(DESTDIR)$(CONFDIR)
